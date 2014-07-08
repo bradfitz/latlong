@@ -4,16 +4,20 @@ package latlong
 
 import (
 	"bufio"
+	"bytes"
 	"flag"
 	"fmt"
 	"hash/crc32"
 	"image"
 	"image/color"
 	"image/png"
+	"io/ioutil"
 	"log"
 	"os"
 	"testing"
 	"time"
+
+	"go/format"
 
 	"code.google.com/p/freetype-go/freetype/raster"
 	"github.com/jonas-p/go-shp"
@@ -83,6 +87,9 @@ func TestGenerate(t *testing.T) {
 	height = int(scale * 180)
 
 	im := image.NewRGBA(image.Rect(0, 0, width, height))
+
+	var gen bytes.Buffer
+	gen.WriteString("// Auto-generated file. See README or Makefile.\n\npackage latlong\n\n")
 
 	drawPoly := func(col color.RGBA, xys ...int) {
 		painter := raster.NewRGBAPainter(im)
@@ -171,7 +178,8 @@ func TestGenerate(t *testing.T) {
 		imo = cloneImage(im)
 	}
 
-	for _, size := range []int{256, 128, 64, 32, 16, 8} {
+	for _, sizeShift := range []uint8{5, 4, 3, 2, 1, 0} {
+		size := int(8 << sizeShift) // 256 ... 8
 		xtiles := width / size
 		ytiles := height / size
 		sizeCount := map[int]int{} // num colors -> count
@@ -229,5 +237,12 @@ func TestGenerate(t *testing.T) {
 	}
 	if *flagWriteImage {
 		saveToPNGFile("regions.png", imo)
+	}
+	fmt, err := format.Source(gen.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ioutil.WriteFile("z_gen_tables.go", fmt, 0644); err != nil {
+		t.Fatal(err)
 	}
 }
