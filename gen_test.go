@@ -78,6 +78,8 @@ var tab = crc32.MakeTable(crc32.IEEE + 1)
 
 var width, height int
 
+const alphaErased = 22 // magic alpha value to mean tile's been erased
+
 func TestGenerate(t *testing.T) {
 	if !*flagGenerate {
 		t.Skip("skipping generationg without --generate flag")
@@ -178,14 +180,19 @@ func TestGenerate(t *testing.T) {
 		imo = cloneImage(im)
 	}
 
+	var solidTile = map[tileKey]string{} // -> zone name
+	var solidTiles []tileKey             // sorted
+
 	for _, sizeShift := range []uint8{5, 4, 3, 2, 1, 0} {
 		size := int(8 << sizeShift) // 256 ... 8
 		xtiles := width / size
 		ytiles := height / size
 		sizeCount := map[int]int{} // num colors -> count
+		skipSquares := 0
 		for yt := 0; yt < ytiles; yt++ {
+		XTile:
 			for xt := 0; xt < xtiles; xt++ {
-				s := map[color.RGBA]bool{}
+				var s map[color.RGBA]bool
 				y0 := yt * size
 				y1 := (yt + 1) * size
 				x0 := xt * size
@@ -193,51 +200,106 @@ func TestGenerate(t *testing.T) {
 				for y := y0; y < y1; y++ {
 					for x := x0; x < x1; x++ {
 						off := im.PixOffset(x, y)
-						if im.Pix[off+3] == 0 {
-							// transparent pixel; ocean or already erased.
+						alpha := im.Pix[off+3]
+						switch alpha {
+						case 0:
+							// transparent pixel
 							continue
+						case alphaErased:
+							skipSquares++
+							// This whole tile has been handled at a higher level. Skip.
+							continue XTile
+						case 255:
+							// expected
+						default:
+							panic("Unexpected alpha value")
 						}
-						nc := color.RGBA{R: im.Pix[off], G: im.Pix[off+1], B: im.Pix[off+2]}
-						if (nc != color.RGBA{}) {
-							s[nc] = true
+						nc := color.RGBA{R: im.Pix[off], G: im.Pix[off+1], B: im.Pix[off+2], A: alpha}
+						if s == nil {
+							s = make(map[color.RGBA]bool)
 						}
+						s[nc] = true
 					}
 				}
 				sizeCount[len(s)]++
-				if imo != nil && (len(s) == 1 || len(s) == 0) {
-					for y := y0; y < y1; y++ {
-						for x := x0; x < x1; x++ {
-							off := im.PixOffset(x, y)
-							switch len(s) {
-							case 1:
-								// Yellow border
-								copy(im.Pix[off:], "\x01\x00\x00\x00")
-								if y == y0 || y == y1-1 || x == x0 || x == x1-1 {
-									imo.Pix[off] = 255 - (128 - byte(size))
-									imo.Pix[off+1] = 255 - (128 - byte(size))
-									imo.Pix[off+2] = 0
-									imo.Pix[off+3] = 255
+				if len(s) == 1 {
+					var c color.RGBA
+					for c = range s {
+						// get first (and only) key
+					}
+					if (c == color.RGBA{}) {
+						panic("no color found for tile")
+					}
+					tk := newTileKey(sizeShift, uint16(xt), uint16(yt))
+					zone := zoneOfColor[c]
+					solidTile[tk] = zone
+					solidTiles = append(solidTiles, tk)
+				}
+				if len(s) == 1 || len(s) == 0 {
+					if imo != nil {
+						for y := y0; y < y1; y++ {
+							for x := x0; x < x1; x++ {
+								off := im.PixOffset(x, y)
+								switch len(s) {
+								case 1:
+									// Yellow border
+									if y == y0 || y == y1-1 || x == x0 || x == x1-1 {
+										imo.Pix[off] = 255 - (128 - byte(size))
+										imo.Pix[off+1] = 255 - (128 - byte(size))
+										imo.Pix[off+2] = 0
+										imo.Pix[off+3] = 255
+									}
+								case 0:
+									if size == 256 {
+										// Fake ocean
+										imo.Pix[off] = 0
+										imo.Pix[off+1] = 0
+										imo.Pix[off+2] = 128
+										imo.Pix[off+3] = 255
+									}
 								}
-							case 0:
-								if size == 256 {
-									// Fake ocean
-									imo.Pix[off] = 0
-									imo.Pix[off+1] = 0
-									imo.Pix[off+2] = 128
-									imo.Pix[off+3] = 255
-								}
-							}
 
+							}
 						}
 					}
+					im.Pix[im.PixOffset(x0, y0)+3] = alphaErased
 				}
 			}
 		}
-		log.Printf("For size %d, dist: %+v", size, sizeCount)
+		log.Printf("For size %d, skipped %d, solids %d, dist: %+v", size, skipSquares, len(solidTile), sizeCount)
 	}
 	if *flagWriteImage {
 		saveToPNGFile("regions.png", imo)
 	}
+
+	staticZoneIndex := map[string]uint16{}
+	var staticZoneNames []string
+	gen.WriteString("// worldTile maps from a tile to an index in tileMapper\n")
+	gen.WriteString("var worldTile = map[tileKey]uint16{\n")
+	for _, tk := range solidTiles {
+		zoneName := solidTile[tk]
+		if zoneName == "" {
+			t.Fatalf("no zone name found for tile %d", tk)
+		}
+		idx, ok := staticZoneIndex[zoneName]
+		if !ok {
+			if len(staticZoneNames) == 0xffff {
+				panic("too many zones")
+			}
+			idx = uint16(len(staticZoneNames))
+			staticZoneNames = append(staticZoneNames, zoneName)
+			staticZoneIndex[zoneName] = idx
+		}
+		fmt.Fprintf(&gen, "\t%d: %d,\n", tk, idx)
+	}
+	gen.WriteString("}\n\n")
+
+	gen.WriteString("var tileMapper = []zoneLooker{\n")
+	for _, zoneName := range staticZoneNames {
+		fmt.Fprintf(&gen, "\tstaticZone(%q),\n", zoneName)
+	}
+	gen.WriteString("}\n\n")
+
 	fmt, err := format.Source(gen.Bytes())
 	if err != nil {
 		t.Fatal(err)
