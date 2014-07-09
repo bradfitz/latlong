@@ -5,8 +5,11 @@ package latlong
 import (
 	"bufio"
 	"bytes"
+	"compress/gzip"
+	"encoding/binary"
 	"flag"
 	"fmt"
+	"go/format"
 	"hash/crc32"
 	"image"
 	"image/color"
@@ -14,10 +17,9 @@ import (
 	"io/ioutil"
 	"log"
 	"os"
+	"sort"
 	"testing"
 	"time"
-
-	"go/format"
 
 	"code.google.com/p/freetype-go/freetype/raster"
 	"github.com/jonas-p/go-shp"
@@ -80,18 +82,14 @@ var width, height int
 
 const alphaErased = 22 // magic alpha value to mean tile's been erased
 
-func TestGenerate(t *testing.T) {
-	if !*flagGenerate {
-		t.Skip("skipping generationg without --generate flag")
-	}
+// the returned zoneOfColor always has A == 256.
+func worldImage(t *testing.T) (im *image.RGBA, zoneOfColor map[color.RGBA]string) {
 	scale := *flagScale
 	width = int(scale * 360)
 	height = int(scale * 180)
 
-	im := image.NewRGBA(image.Rect(0, 0, width, height))
-
-	var gen bytes.Buffer
-	gen.WriteString("// Auto-generated file. See README or Makefile.\n\npackage latlong\n\n")
+	im = image.NewRGBA(image.Rect(0, 0, width, height))
+	zoneOfColor = map[color.RGBA]string{}
 
 	drawPoly := func(col color.RGBA, xys ...int) {
 		painter := raster.NewRGBAPainter(im)
@@ -107,27 +105,22 @@ func TestGenerate(t *testing.T) {
 
 	sr, err := shp.Open("world/tz_world.shp")
 	if err != nil {
-		log.Fatalf("Error opening world/tz_world.shp: %v; unzip it from http://efele.net/maps/tz/world/tz_world.zip")
+		t.Fatalf("Error opening world/tz_world.shp: %v; unzip it from http://efele.net/maps/tz/world/tz_world.zip", err)
 	}
 	defer sr.Close()
 
-	var zoneOfColor = map[color.RGBA]string{}
-
-	var failZone int
 	for sr.Next() {
 		i, s := sr.Shape()
 		p, ok := s.(*shp.Polygon)
 		if !ok {
-			log.Printf("Unknown shape %T", p)
-			continue
+			t.Fatalf("Unknown shape %T", p)
 		}
 		zoneName := sr.ReadAttribute(i, 0)
 		if zoneName == "uninhabited" {
 			continue
 		}
 		if _, err := time.LoadLocation(zoneName); err != nil {
-			t.Logf("Failed to load: %v (%v)", zoneName, err)
-			failZone++
+			t.Fatalf("Failed to load: %v (%v)", zoneName, err)
 		}
 		hash := crc32.Checksum([]byte(zoneName), tab)
 		col := color.RGBA{uint8(hash >> 24), uint8(hash >> 16), uint8(hash >> 8), 255}
@@ -168,20 +161,45 @@ func TestGenerate(t *testing.T) {
 		ap(2217), ap(1714),
 		ap(2204), ap(1724),
 		ap(2160), ap(1537))
+	return
+}
 
-	for c, name := range zoneOfColor {
-		log.Printf("%v = %s\n", c, name)
+func TestGenerate(t *testing.T) {
+	if !*flagGenerate {
+		t.Skip("skipping generationg without --generate flag")
 	}
-	log.Printf("Num zones = %d (%d failed to load)", len(zoneOfColor), failZone)
+
+	im, zoneOfColor := worldImage(t)
+
+	var gen bytes.Buffer
+	gen.WriteString("// Auto-generated file. See README or Makefile.\n\npackage latlong\n\n")
+
+	var zoneLookers bytes.Buffer
+	zoneLookers.WriteString("var zoneLookers = []zoneLooker{\n")
+
+	staticZoneIndex := map[string]uint16{}
+
+	var zones []string
+	for _, zone := range zoneOfColor {
+		zones = append(zones, zone)
+	}
+	sort.Strings(zones)
+	for i, zone := range zones {
+		staticZoneIndex[zone] = uint16(i)
+		fmt.Fprintf(&zoneLookers, "\tstaticZone(%q),\n", zone)
+	}
+
+	log.Printf("Num zones = %d", len(zones))
 
 	var imo *image.RGBA // output image
 	if *flagWriteImage {
-		saveToPNGFile(file, im)
+		//saveToPNGFile(file, im)
 		imo = cloneImage(im)
 	}
 
 	var solidTile = map[tileKey]string{} // -> zone name
-	var solidTiles []tileKey             // sorted
+	var solidTiles [6][]tileKey          // partitioned by sizeShift, then sorted
+	var pixColorSeen = map[color.RGBA]bool{}
 
 	for _, sizeShift := range []uint8{5, 4, 3, 2, 1, 0} {
 		size := int(8 << sizeShift) // 256 ... 8
@@ -233,9 +251,20 @@ func TestGenerate(t *testing.T) {
 					tk := newTileKey(sizeShift, uint16(xt), uint16(yt))
 					zone := zoneOfColor[c]
 					solidTile[tk] = zone
-					solidTiles = append(solidTiles, tk)
+					solidTiles[sizeShift] = append(solidTiles[sizeShift], tk)
+				}
+				if sizeShift == 0 && len(s) > 1 {
+					for c := range s {
+						pixColorSeen[c] = true
+					}
 				}
 				if len(s) == 1 || len(s) == 0 {
+					for y := y0; y < y1; y += 8 {
+						for x := x0; x < x1; x += 8 {
+							off := im.PixOffset(x, y)
+							im.Pix[off+3] = alphaErased
+						}
+					}
 					if imo != nil {
 						for y := y0; y < y1; y++ {
 							for x := x0; x < x1; x++ {
@@ -250,58 +279,62 @@ func TestGenerate(t *testing.T) {
 										imo.Pix[off+3] = 255
 									}
 								case 0:
-									if size == 256 {
-										// Fake ocean
-										imo.Pix[off] = 0
-										imo.Pix[off+1] = 0
-										imo.Pix[off+2] = 128
-										imo.Pix[off+3] = 255
-									}
+									// Fake ocean
+									imo.Pix[off] = 0
+									imo.Pix[off+1] = 0
+									imo.Pix[off+2] = 128
+									imo.Pix[off+3] = 255
 								}
 
 							}
 						}
 					}
-					im.Pix[im.PixOffset(x0, y0)+3] = alphaErased
 				}
 			}
 		}
 		log.Printf("For size %d, skipped %d, solids %d, dist: %+v", size, skipSquares, len(solidTile), sizeCount)
 	}
+	log.Printf("Pixel colors seen: %d", len(pixColorSeen))
 	if *flagWriteImage {
 		saveToPNGFile("regions.png", imo)
 	}
 
-	staticZoneIndex := map[string]uint16{}
-	var staticZoneNames []string
-	gen.WriteString("// worldTile maps from a tile to an index in tileMapper\n")
-	gen.WriteString("var worldTile = map[tileKey]uint16{\n")
-	for _, tk := range solidTiles {
-		zoneName := solidTile[tk]
-		if zoneName == "" {
-			t.Fatalf("no zone name found for tile %d", tk)
-		}
-		idx, ok := staticZoneIndex[zoneName]
-		if !ok {
-			if len(staticZoneNames) == 0xffff {
-				panic("too many zones")
+	gen.WriteString("// worldTile maps from size to gzipLookers.\n")
+	gen.WriteString("var worldTile = [6]*gzipLooker{\n")
+	for size := 5; size >= 0; size-- {
+		fmt.Fprintf(&gen, "\t%d: &gzipLooker{\n", size)
+		var buf bytes.Buffer
+		for _, tk := range solidTiles[size] {
+			zoneName := solidTile[tk]
+			if zoneName == "" {
+				t.Fatalf("no zone name found for tile %d", tk)
 			}
-			idx = uint16(len(staticZoneNames))
-			staticZoneNames = append(staticZoneNames, zoneName)
-			staticZoneIndex[zoneName] = idx
+			idx, ok := staticZoneIndex[zoneName]
+			if !ok {
+				panic("zone should've been registered: " + zoneName)
+			}
+			binary.Write(&buf, binary.BigEndian, tk)
+			binary.Write(&buf, binary.BigEndian, idx)
 		}
-		fmt.Fprintf(&gen, "\t%d: %d,\n", tk, idx)
+		var zbuf bytes.Buffer
+		zw := gzip.NewWriter(&zbuf)
+		zw.Write(buf.Bytes())
+		zw.Flush()
+
+		log.Printf("size %d is %d entries: %d bytes (%d bytes compressed)", size, len(solidTiles[size]), buf.Len(), zbuf.Len())
+		fmt.Fprintf(&gen, "\t\tgzipData: %q,\n", zbuf.Bytes())
+		gen.WriteString("\t},\n")
 	}
 	gen.WriteString("}\n\n")
 
-	gen.WriteString("var tileMapper = []zoneLooker{\n")
-	for _, zoneName := range staticZoneNames {
-		fmt.Fprintf(&gen, "\tstaticZone(%q),\n", zoneName)
-	}
-	gen.WriteString("}\n\n")
+	zoneLookers.WriteString("}\n\n")
+
+	// var zoneLookers = []zoneLooker{ ...
+	gen.Write(zoneLookers.Bytes())
 
 	fmt, err := format.Source(gen.Bytes())
 	if err != nil {
+		ioutil.WriteFile("z_gen_tables.go", gen.Bytes(), 0644)
 		t.Fatal(err)
 	}
 	if err := ioutil.WriteFile("z_gen_tables.go", fmt, 0644); err != nil {

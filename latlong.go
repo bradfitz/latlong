@@ -52,6 +52,11 @@ func (z staticZone) LookupZone(lat, long float64) (zone string, ok bool) {
 	return string(z), true
 }
 
+type worldGrid struct {
+	tile map[tileKey]uint16 // value indexes into zone
+	zone []zoneLooker
+}
+
 // A tilekey is a packed 32 bit integer where:
 // 3 high bits: tile size: 8<<n (8 to 256 for n=0-5)
 // bits 0-13 bits: x tile position
@@ -78,4 +83,14 @@ func (v tileKey) x() uint16 {
 
 func (v tileKey) y() uint16 {
 	return uint16((v >> 14) & (1<<14 - 1))
+}
+
+type tileLooker struct {
+	tile tileKey
+	idx  uint16 // index into tileMapper
+}
+
+type gzipLooker struct {
+	gzipData string       // compressed [tilekey][uint16_idx], repeated
+	tiles    []tileLooker // lazily populated
 }
