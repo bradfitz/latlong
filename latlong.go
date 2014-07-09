@@ -22,23 +22,11 @@ limitations under the License.
 // are compiled in to this package and do not require explicit loading.
 package latlong
 
-import (
-	"errors"
-	"time"
-)
-
-var ErrNotFound = errors.New("latlong: the timezone wasn't found")
-
 // LookupZoneName returns the timezone name at the given latitude and
-// longitude. The names are those given at http://efele.net/maps/tz/world/
-// For example: "America/New_York".
-func LookupZoneName(lat, long float64) (zone string, ok bool) {
-	panic("TODO")
-}
-
-// LookupLocation returns a timezone Locatio given a latitude and
-// longitude. If the location isn't found, the error is ErrNotFound.
-func LookupLocation(lat, long float64) (*time.Location, error) {
+// longitude. The returned name is either the empty string (if not
+// found) or a name suitable for passing to time.LoadLocation. For
+// example, "America/New_York".
+func LookupZoneName(lat, long float64) string {
 	panic("TODO")
 }
 
@@ -93,4 +81,12 @@ type tileLooker struct {
 type gzipLooker struct {
 	gzipData string       // compressed [tilekey][uint16_idx], repeated
 	tiles    []tileLooker // lazily populated
+}
+
+// A twoBitTile represents a fully opaque 8x8 grid tile that only has
+// two colors. The idx represents the indexes of the two colors (the palette)
+// table, and the rows are the bits.
+type twoBitTile struct {
+	idx  [2]uint16 // bit 0 and bit 1's index into zoneLookers
+	rows [8]uint8  // [y], then 1<<x.
 }
