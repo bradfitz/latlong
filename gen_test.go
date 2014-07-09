@@ -159,6 +159,35 @@ func worldImage(t *testing.T) (im *image.RGBA, zoneOfColor map[color.RGBA]string
 	return
 }
 
+// A setIndexTracker that tells each index which item number it is, and can
+// retrieve that item's index later as well.
+type setIndexTracker struct {
+	s map[interface{}]uint16
+	l []interface{}
+}
+
+func (s *setIndexTracker) Lookup(v interface{}) (idx uint16, ok bool) {
+	idx, ok = s.s[v]
+	return
+}
+
+func (s *setIndexTracker) Add(v interface{}) (idx uint16, isNew bool) {
+	if idx, ok := s.s[v]; ok {
+		return idx, false
+	}
+
+	if len(s.s) > 0xffff {
+		panic("too many items in set")
+	}
+	idx = uint16(len(s.s))
+	if s.s == nil {
+		s.s = make(map[interface{}]uint16)
+	}
+	s.s[v] = idx
+	s.l = append(s.l, v)
+	return idx, true
+}
+
 func TestGenerate(t *testing.T) {
 	if !*flagGenerate {
 		t.Skip("skipping generationg without --generate flag")
@@ -166,39 +195,55 @@ func TestGenerate(t *testing.T) {
 
 	im, zoneOfColor := worldImage(t)
 
+	// The auto-generated source file (z_gen_tables.go)
 	var gen bytes.Buffer
 	gen.WriteString("// Auto-generated file. See README or Makefile.\n\npackage latlong\n\n")
 
+	// Source code for just the zoneLookers variables.
 	var zoneLookers bytes.Buffer
 	zoneLookers.WriteString("var zoneLookers = []zoneLooker{\n")
 
-	staticZoneIndex := map[string]uint16{}
+	// Maps from a unique key (either a string or colorTile) to
+	// its index.
+	var zoneIndex setIndexTracker
 
-	var zones []string
-	for _, zone := range zoneOfColor {
-		zones = append(zones, zone)
+	// Add the static timezones (~408 of them). If a tile (which
+	// can range from 8 to 256 pixels square) doesn't resolve to
+	// one of these, it'll resolve to an image tile that then
+	// resolves to one of these.
+	{
+		var zones []string
+		for _, zone := range zoneOfColor {
+			zones = append(zones, zone)
+		}
+		sort.Strings(zones)
+		for i, zone := range zones {
+			idx, _ := zoneIndex.Add(zone)
+			if idx != uint16(i) {
+				panic("unexpected")
+			}
+			fmt.Fprintf(&zoneLookers, "\tstaticZone(%q),\n", zone)
+		}
+		log.Printf("Num zones = %d", len(zones))
 	}
-	sort.Strings(zones)
-	for i, zone := range zones {
-		staticZoneIndex[zone] = uint16(i)
-		fmt.Fprintf(&zoneLookers, "\tstaticZone(%q),\n", zone)
-	}
-
-	log.Printf("Num zones = %d", len(zones))
-
-	var solidTile = map[tileKey]string{} // -> zone name
-	var solidTiles [6][]tileKey          // partitioned by sizeShift, then sorted
 
 	var imo *image.RGBA
 	if *flagWriteImage {
 		imo = cloneImage(im)
 	}
+	dupColorTiles := 0
 
+	gen.WriteString("// worldTile maps from size to gzipLookers.\n")
+	gen.WriteString("var worldTile = [6]*gzipLooker{\n")
 	for _, sizeShift := range []uint8{5, 4, 3, 2, 1, 0} {
+		fmt.Fprintf(&gen, "\t%d: &gzipLooker{\n", sizeShift)
+		var keyIdxBuf bytes.Buffer // repeated binary [tilekey][uint16_idx]
+
 		pass := newSizePass(im, imo, sizeShift)
 
 		skipSquares := 0
 		sizeCount := map[int]int{} // num colors -> count
+
 		pass.foreachTile(func(tile *tileMeta) {
 			if tile.skipped {
 				skipSquares++
@@ -210,11 +255,13 @@ func TestGenerate(t *testing.T) {
 				tile.erase()
 			}
 			if nColor == 1 {
-				c := tile.color()
-				tk := tile.key()
-				zone := zoneOfColor[c]
-				solidTile[tk] = zone
-				solidTiles[sizeShift] = append(solidTiles[sizeShift], tk)
+				zoneName := zoneOfColor[tile.color()]
+				if idx, isNew := zoneIndex.Add(zoneName); isNew {
+					panic("zone should've been registered: " + zoneName)
+				} else {
+					binary.Write(&keyIdxBuf, binary.BigEndian, tile.key())
+					binary.Write(&keyIdxBuf, binary.BigEndian, idx)
+				}
 				tile.drawBorder()
 				return
 			}
@@ -222,46 +269,39 @@ func TestGenerate(t *testing.T) {
 				tile.paintOcean()
 				return
 			}
-			// TODO: deal with colors >= 2
+			if sizeShift == 0 && nColor >= 2 {
+				ct := tile.colorTile()
+				idx, isNew := zoneIndex.Add(ct)
+				if isNew {
+					// t.Logf("TODO: dump out %+v", ct)
+				} else {
+					dupColorTiles++
+				}
+				binary.Write(&keyIdxBuf, binary.BigEndian, tile.key())
+				binary.Write(&keyIdxBuf, binary.BigEndian, idx)
+			}
 		})
-		log.Printf("For size %d, skipped %d, solids %d, dist: %+v", pass.size, skipSquares, len(solidTile), sizeCount)
-	}
+		log.Printf("For size %d, skipped %d, dist: %+v", pass.size, skipSquares, sizeCount)
 
-	if imo != nil {
-		saveToPNGFile("regions.png", imo)
-	}
-
-	gen.WriteString("// worldTile maps from size to gzipLookers.\n")
-	gen.WriteString("var worldTile = [6]*gzipLooker{\n")
-	for size := 5; size >= 0; size-- {
-		fmt.Fprintf(&gen, "\t%d: &gzipLooker{\n", size)
-		var buf bytes.Buffer
-		for _, tk := range solidTiles[size] {
-			zoneName := solidTile[tk]
-			if zoneName == "" {
-				t.Fatalf("no zone name found for tile %d", tk)
-			}
-			idx, ok := staticZoneIndex[zoneName]
-			if !ok {
-				panic("zone should've been registered: " + zoneName)
-			}
-			binary.Write(&buf, binary.BigEndian, tk)
-			binary.Write(&buf, binary.BigEndian, idx)
-		}
 		var zbuf bytes.Buffer
 		zw := gzip.NewWriter(&zbuf)
-		zw.Write(buf.Bytes())
+		zw.Write(keyIdxBuf.Bytes())
 		zw.Flush()
 
-		log.Printf("size %d is %d entries: %d bytes (%d bytes compressed)", size, len(solidTiles[size]), buf.Len(), zbuf.Len())
+		log.Printf("size %d is %d entries: %d bytes (%d bytes compressed)", pass.size, keyIdxBuf.Len()/6, keyIdxBuf.Len(), zbuf.Len())
 		fmt.Fprintf(&gen, "\t\tgzipData: %q,\n", zbuf.Bytes())
 		gen.WriteString("\t},\n")
 	}
 	gen.WriteString("}\n\n")
 
-	zoneLookers.WriteString("}\n\n")
+	log.Printf("Duplicate 8x8 pixmaps: %d", dupColorTiles)
+
+	if imo != nil {
+		saveToPNGFile("regions.png", imo)
+	}
 
 	// var zoneLookers = []zoneLooker{ ...
+	zoneLookers.WriteString("}\n\n")
 	gen.Write(zoneLookers.Bytes())
 
 	fmt, err := format.Source(gen.Bytes())
@@ -440,3 +480,18 @@ func (t *tileMeta) erase() {
 	}
 
 }
+
+func (t *tileMeta) colorTile() (ct colorTile) {
+	im := t.p.im
+	for y := range ct {
+		row := &ct[y]
+		pix := im.Pix[im.PixOffset(t.x0, t.y0+y):]
+		for x := range row {
+			row[x] = color.RGBA{pix[0], pix[1], pix[2], pix[3]}
+			pix = pix[4:]
+		}
+	}
+	return
+}
+
+type colorTile [8][8]color.RGBA
