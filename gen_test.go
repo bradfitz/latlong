@@ -25,8 +25,6 @@ import (
 	"github.com/jonas-p/go-shp"
 )
 
-const file = "worldtz.png"
-
 var (
 	flagGenerate   = flag.Bool("generate", false, "Do generation")
 	flagWriteImage = flag.Bool("write_image", false, "Write out a debug image")
@@ -76,20 +74,17 @@ func loadImage(filename string) *image.NRGBA {
 	return im.(*image.NRGBA)
 }
 
-var tab = crc32.MakeTable(crc32.IEEE + 1)
-
-var width, height int
-
 const alphaErased = 22 // magic alpha value to mean tile's been erased
 
 // the returned zoneOfColor always has A == 256.
 func worldImage(t *testing.T) (im *image.RGBA, zoneOfColor map[color.RGBA]string) {
 	scale := *flagScale
-	width = int(scale * 360)
-	height = int(scale * 180)
+	width := int(scale * 360)
+	height := int(scale * 180)
 
 	im = image.NewRGBA(image.Rect(0, 0, width, height))
 	zoneOfColor = map[color.RGBA]string{}
+	tab := crc32.MakeTable(crc32.IEEE + 1)
 
 	drawPoly := func(col color.RGBA, xys ...int) {
 		painter := raster.NewRGBAPainter(im)
@@ -191,10 +186,6 @@ func TestGenerate(t *testing.T) {
 
 	log.Printf("Num zones = %d", len(zones))
 
-	if *flagWriteImage {
-		saveToPNGFile(file, im)
-	}
-
 	var solidTile = map[tileKey]string{} // -> zone name
 	var solidTiles [6][]tileKey          // partitioned by sizeShift, then sorted
 
@@ -208,33 +199,30 @@ func TestGenerate(t *testing.T) {
 
 		skipSquares := 0
 		sizeCount := map[int]int{} // num colors -> count
-		pass.foreachTile(func(xt, yt int, colors map[color.RGBA]bool, skipped bool) {
-			if skipped {
+		pass.foreachTile(func(tile *tileMeta) {
+			if tile.skipped {
 				skipSquares++
 				return
 			}
-			nColor := len(colors)
+			nColor := len(tile.colors)
 			sizeCount[nColor]++
 			if nColor < 2 {
-				pass.eraseTile(xt, yt)
+				tile.erase()
 			}
 			if nColor == 1 {
-				var c color.RGBA
-				for c = range colors {
-					// get first (and only) key
-				}
-				if (c == color.RGBA{}) {
-					panic("no color found for tile")
-				}
-				tk := newTileKey(sizeShift, uint16(xt), uint16(yt))
+				c := tile.color()
+				tk := tile.key()
 				zone := zoneOfColor[c]
 				solidTile[tk] = zone
 				solidTiles[sizeShift] = append(solidTiles[sizeShift], tk)
-				pass.drawBorder(xt, yt)
+				tile.drawBorder()
+				return
 			}
 			if nColor == 0 {
-				pass.paintOcean(xt, yt)
+				tile.paintOcean()
+				return
 			}
+			// TODO: deal with colors >= 2
 		})
 		log.Printf("For size %d, skipped %d, solids %d, dist: %+v", pass.size, skipSquares, len(solidTile), sizeCount)
 	}
@@ -309,22 +297,28 @@ func newSizePass(im, imo *image.RGBA, sizeShift uint8) *sizePass {
 	return p
 }
 
-// colors will only contain a zero color if the tile size is smallest
-// (8x8) and there's an ocean (zero color) and two others. If there's
-// an ocean and only 1 other color, only one color will be returned.
-func (p *sizePass) foreachTile(fn func(xt, yt int, colors map[color.RGBA]bool, skipped bool)) {
+func (p *sizePass) foreachTile(fn func(*tileMeta)) {
+	tm := new(tileMeta)
 	im := p.im
+
+	colors := map[color.RGBA]bool{}
+	// clearColors wipes colors, so we can re-use it.
+	clearColors := func() {
+		for k := range colors {
+			delete(colors, k)
+		}
+	}
+
 	for yt := 0; yt < p.ytiles; yt++ {
-	XTile:
 		for xt := 0; xt < p.xtiles; xt++ {
-			var s map[color.RGBA]bool
+			*tm = tileMeta{p: p, xt: xt, yt: yt, colors: colors}
+			tm.setBounds()
 			sawOcean := false
-			y0 := yt * p.size
-			y1 := (yt + 1) * p.size
-			x0 := xt * p.size
-			x1 := (xt + 1) * p.size
-			for y := y0; y < y1; y++ {
-				for x := x0; x < x1; x++ {
+			x1, y1 := tm.x1, tm.y1
+			clearColors()
+		Pixels:
+			for y := tm.y0; y < y1; y++ {
+				for x := tm.x0; x < x1; x++ {
 					off := im.PixOffset(x, y)
 					alpha := im.Pix[off+3]
 					switch alpha {
@@ -332,73 +326,103 @@ func (p *sizePass) foreachTile(fn func(xt, yt int, colors map[color.RGBA]bool, s
 						sawOcean = true
 						continue
 					case alphaErased:
-						if x != x0 || y != y0 {
+						if x != tm.x0 || y != tm.y0 {
 							panic("unexpected")
 						}
-						// This whole tile has been handled at a higher level. Skip.
-						fn(xt, yt, nil, true /* skipped */)
-						continue XTile
+						tm.skipped = true
+						break Pixels
 					case 255:
 						// expected
 					default:
 						panic("Unexpected alpha value")
 					}
 					nc := color.RGBA{R: im.Pix[off], G: im.Pix[off+1], B: im.Pix[off+2], A: alpha}
-					if s == nil {
-						s = make(map[color.RGBA]bool)
-					}
-					s[nc] = true
+					colors[nc] = true
 				}
 			}
-			if len(s) > 1 && sawOcean {
+			if len(colors) > 1 && sawOcean {
 				// note the ocean, since this can't be solid anyway
-				s[color.RGBA{}] = true
+				colors[color.RGBA{}] = true
 			}
-			fn(xt, yt, s, false)
+			fn(tm)
 		}
 	}
 }
 
-func (p *sizePass) paintOcean(xt, yt int) {
+type tileMeta struct {
+	p      *sizePass
+	xt, yt int
+
+	x0, x1, y0, y1 int
+
+	// skipped reports whether the tile was skipped due to seeing
+	// erasure from previous level.
+	skipped bool
+
+	// colors will only contain a zero color if the tile size is smallest
+	// (8x8) and there's an ocean (zero color) and two others. If there's
+	// an ocean and only 1 other color, only one color will be returned.
+	colors map[color.RGBA]bool
+}
+
+func (t *tileMeta) setBounds() {
+	size := t.p.size
+	t.y0 = t.yt * size
+	t.y1 = (t.yt + 1) * size
+	t.x0 = t.xt * size
+	t.x1 = (t.xt + 1) * size
+}
+
+func (t *tileMeta) color() color.RGBA {
+	if len(t.colors) != 1 {
+		panic("color called with colors != 1")
+	}
+	var c color.RGBA
+	for c = range t.colors {
+		// get first (and only) key
+	}
+	if (c == color.RGBA{}) {
+		panic("no color found for tile")
+	}
+	return c
+}
+
+func (t *tileMeta) key() tileKey {
+	return newTileKey(t.p.sizeShift, uint16(t.xt), uint16(t.yt))
+}
+
+func (t *tileMeta) paintOcean() {
+	p := t.p
 	imo := p.imo
 	if imo == nil {
 		return
 	}
-	im, size := p.im, p.size
-	y0 := yt * size
-	y1 := (yt + 1) * size
-	x0 := xt * size
-	x1 := (xt + 1) * size
-	for y := y0; y < y1; y++ {
-		for x := x0; x < x1; x++ {
-			off := im.PixOffset(x, y)
-			imo.Pix[off] = 0
-			imo.Pix[off+1] = 0
-			imo.Pix[off+2] = 128
-			imo.Pix[off+3] = 255
+	blue := [4]uint8{0, 0, 128, 255}
+	size := p.size
+	for y := t.y0; y < t.y1; y++ {
+		off := imo.PixOffset(t.x0, y)
+		for x := 0; x < size; x++ {
+			copy(imo.Pix[off:], blue[:])
+			off += 4
 		}
 	}
 }
 
-func (p *sizePass) drawBorder(xt, yt int) {
+func (t *tileMeta) drawBorder() {
+	p := t.p
 	imo := p.imo
 	if imo == nil {
 		return
 	}
-	im, size := p.im, p.size
-	y0 := yt * size
-	y1 := (yt + 1) * size
-	x0 := xt * size
-	x1 := (xt + 1) * size
 
 	yellow := uint8(255 - (128 - byte(p.size)))
 	color := [4]uint8{yellow, yellow, 0, 255}
 
-	for y := y0; y < y1; y++ {
-		off := im.PixOffset(x0, y)
-		for x := x0; x < x1; x++ {
+	for y := t.y0; y < t.y1; y++ {
+		off := imo.PixOffset(t.x0, y)
+		for x := t.x0; x < t.x1; x++ {
 			// Border:
-			if y == y0 || y == y1-1 || x == x0 || x == x1-1 {
+			if y == t.y0 || y == t.y1-1 || x == t.x0 || x == t.x1-1 {
 				copy(imo.Pix[off:], color[:])
 			}
 			off += 4
@@ -406,14 +430,10 @@ func (p *sizePass) drawBorder(xt, yt int) {
 	}
 }
 
-func (p *sizePass) eraseTile(xt, yt int) {
-	im, size := p.im, p.size
-	y0 := yt * p.size
-	y1 := (yt + 1) * size
-	x0 := xt * size
-	x1 := (xt + 1) * size
-	for y := y0; y < y1; y += 8 {
-		for x := x0; x < x1; x += 8 {
+func (t *tileMeta) erase() {
+	im := t.p.im
+	for y := t.y0; y < t.y1; y += 8 {
+		for x := t.x0; x < t.x1; x += 8 {
 			off := im.PixOffset(x, y)
 			im.Pix[off+3] = alphaErased
 		}
