@@ -207,6 +207,17 @@ func TestGenerate(t *testing.T) {
 	// its index.
 	var zoneIndex setIndexTracker
 
+	zoneIndexOfColor := func(c color.RGBA) uint16 {
+		if (c == color.RGBA{}) {
+			return 0xffff
+		}
+		idx, ok := zoneIndex.Lookup(zoneOfColor[c])
+		if !ok {
+			t.Fatalf("failed to find zone index for color %+v", c)
+		}
+		return idx
+	}
+
 	// Add the static timezones (~408 of them). If a tile (which
 	// can range from 8 to 256 pixels square) doesn't resolve to
 	// one of these, it'll resolve to an image tile that then
@@ -273,7 +284,7 @@ func TestGenerate(t *testing.T) {
 				ct := tile.colorTile()
 				idx, isNew := zoneIndex.Add(ct)
 				if isNew {
-					// t.Logf("TODO: dump out %+v", ct)
+					fmt.Fprintf(&zoneLookers, "\tpixmap(%q),\n", pass.pixmapIndexBytes(ct, zoneIndexOfColor))
 				} else {
 					dupColorTiles++
 				}
@@ -321,6 +332,8 @@ type sizePass struct {
 	xtiles, ytiles int
 	im             *image.RGBA
 	imo            *image.RGBA // or nil if not generating an output image
+
+	buf [128]byte // for pixmap 8x8 uint16 indexes
 }
 
 func newSizePass(im, imo *image.RGBA, sizeShift uint8) *sizePass {
@@ -387,6 +400,17 @@ func (p *sizePass) foreachTile(fn func(*tileMeta)) {
 			fn(tm)
 		}
 	}
+}
+
+func (p *sizePass) pixmapIndexBytes(ct colorTile, fn func(color.RGBA) uint16) []byte {
+	buf := p.buf[:]
+	for _, row := range ct {
+		for _, c := range row {
+			binary.BigEndian.PutUint16(buf, fn(c))
+			buf = buf[2:]
+		}
+	}
+	return p.buf[:]
 }
 
 type tileMeta struct {

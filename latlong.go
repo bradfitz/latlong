@@ -90,3 +90,16 @@ type twoBitTile struct {
 	idx  [2]uint16 // bit 0 and bit 1's index into zoneLookers
 	rows [8]uint8  // [y], then 1<<x.
 }
+
+// pixmap packs 8x8 row-order big ending uint16 indexes into
+// zoneLookers. Each string is 128 bytes long.
+type pixmap string
+
+func (p pixmap) LookupZone(lat, long float64) (zone string, ok bool) {
+	panic("TODO")
+}
+
+// The oceanIndex is a magic index into zoneLooker which says that
+// it's invalid and there's an ocean or something there. Unknown
+// timezone.
+const oceanIndex uint16 = 0xff
