@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"encoding/base64"
 	"encoding/binary"
 	"flag"
 	"fmt"
@@ -188,6 +189,39 @@ func (s *setIndexTracker) Add(v interface{}) (idx uint16, isNew bool) {
 	return idx, true
 }
 
+func TestAllPixels(t *testing.T) {
+	if degPixels == -1 {
+		t.Skip("data not generated yet")
+	}
+	im, zoneOfColor := worldImage(t)
+	w := im.Bounds().Max.X
+	h := im.Bounds().Max.Y
+	total, fail := 0, 0
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			pix := im.Pix[im.PixOffset(x, y):]
+			if pix[3] == 0 {
+				continue
+			}
+			total++
+			c := color.RGBA{
+				R: pix[0],
+				G: pix[1],
+				B: pix[2],
+				A: 255,
+			}
+			want := zoneOfColor[c]
+			if got := lookupPixel(x, y); got != want {
+				fail++
+				if fail <= 10 {
+					t.Errorf("pixel(%d, %d) = %q; want %q", x, y, got, want)
+				}
+			}
+		}
+	}
+	t.Logf("%d pixels tested; %d failures", total, fail)
+}
+
 func TestGenerate(t *testing.T) {
 	if !*flagGenerate {
 		t.Skip("skipping generationg without --generate flag")
@@ -198,10 +232,12 @@ func TestGenerate(t *testing.T) {
 	// The auto-generated source file (z_gen_tables.go)
 	var gen bytes.Buffer
 	gen.WriteString("// Auto-generated file. See README or Makefile.\n\npackage latlong\n\n")
+	gen.WriteString("func init() {\n")
+
+	fmt.Fprintf(&gen, "degPixels = %d\n", int(*flagScale))
 
 	// Source code for just the zoneLookers variables.
-	var zoneLookers bytes.Buffer
-	zoneLookers.WriteString("var zoneLookers = []zoneLooker{\n")
+	var zoneLookers zoneLookerWriter
 
 	// Maps from a unique key (either a string or colorTile) to
 	// its index.
@@ -209,7 +245,7 @@ func TestGenerate(t *testing.T) {
 
 	zoneIndexOfColor := func(c color.RGBA) uint16 {
 		if (c == color.RGBA{}) {
-			return 0xffff
+			return oceanIndex
 		}
 		idx, ok := zoneIndex.Lookup(zoneOfColor[c])
 		if !ok {
@@ -233,7 +269,7 @@ func TestGenerate(t *testing.T) {
 			if idx != uint16(i) {
 				panic("unexpected")
 			}
-			fmt.Fprintf(&zoneLookers, "\tstaticZone(%q),\n", zone)
+			zoneLookers.Add("S" + zone)
 		}
 		log.Printf("Num zones = %d", len(zones))
 	}
@@ -244,10 +280,9 @@ func TestGenerate(t *testing.T) {
 	}
 	dupColorTiles := 0
 
-	gen.WriteString("// worldTile maps from size to gzipLookers.\n")
-	gen.WriteString("var worldTile = [6]*gzipLooker{\n")
+	gen.WriteString("zoomLevels = [6]*zoomLevel{\n")
 	for _, sizeShift := range []uint8{5, 4, 3, 2, 1, 0} {
-		fmt.Fprintf(&gen, "\t%d: &gzipLooker{\n", sizeShift)
+		fmt.Fprintf(&gen, "\t%d: &zoomLevel{\n", sizeShift)
 		var keyIdxBuf bytes.Buffer // repeated binary [tilekey][uint16_idx]
 
 		pass := newSizePass(im, imo, sizeShift)
@@ -284,7 +319,11 @@ func TestGenerate(t *testing.T) {
 				ct := tile.colorTile()
 				idx, isNew := zoneIndex.Add(ct)
 				if isNew {
-					fmt.Fprintf(&zoneLookers, "\tpixmap(%q),\n", pass.pixmapIndexBytes(ct, zoneIndexOfColor))
+					if nColor == 2 {
+						zoneLookers.Add(fmt.Sprintf("2%s", pass.bitmapPixmapBytes(ct, zoneIndexOfColor)))
+					} else {
+						zoneLookers.Add(fmt.Sprintf("P%s", pass.pixmapIndexBytes(ct, zoneIndexOfColor)))
+					}
 				} else {
 					dupColorTiles++
 				}
@@ -297,10 +336,11 @@ func TestGenerate(t *testing.T) {
 		var zbuf bytes.Buffer
 		zw := gzip.NewWriter(&zbuf)
 		zw.Write(keyIdxBuf.Bytes())
-		zw.Flush()
+		zw.Close()
 
 		log.Printf("size %d is %d entries: %d bytes (%d bytes compressed)", pass.size, keyIdxBuf.Len()/6, keyIdxBuf.Len(), zbuf.Len())
-		fmt.Fprintf(&gen, "\t\tgzipData: %q,\n", zbuf.Bytes())
+
+		fmt.Fprintf(&gen, "\t\tgzipData: %q,\n", base64.StdEncoding.EncodeToString(zbuf.Bytes()))
 		gen.WriteString("\t},\n")
 	}
 	gen.WriteString("}\n\n")
@@ -311,9 +351,8 @@ func TestGenerate(t *testing.T) {
 		saveToPNGFile("regions.png", imo)
 	}
 
-	// var zoneLookers = []zoneLooker{ ...
-	zoneLookers.WriteString("}\n\n")
-	gen.Write(zoneLookers.Bytes())
+	gen.Write(zoneLookers.Source())
+	gen.WriteString("}\n") // close init
 
 	fmt, err := format.Source(gen.Bytes())
 	if err != nil {
@@ -410,7 +449,34 @@ func (p *sizePass) pixmapIndexBytes(ct colorTile, fn func(color.RGBA) uint16) []
 			buf = buf[2:]
 		}
 	}
-	return p.buf[:]
+	return p.buf[:128]
+}
+
+// For two-color tiles.
+func (p *sizePass) bitmapPixmapBytes(ct colorTile, fn func(color.RGBA) uint16) []byte {
+	var c1, c2 color.RGBA
+	var bits uint64
+	var n uint8
+	for _, row := range ct {
+		for _, c := range row {
+			if n == 0 {
+				c1 = c
+			} else {
+				if c != c1 {
+					c2 = c
+					bits |= (1 << n)
+				}
+			}
+			n++
+		}
+	}
+	if c1 == c2 {
+		panic("didn't see two colors")
+	}
+	binary.BigEndian.PutUint16(p.buf[0:2], fn(c1))
+	binary.BigEndian.PutUint16(p.buf[2:4], fn(c2))
+	binary.BigEndian.PutUint64(p.buf[4:12], bits)
+	return p.buf[:12]
 }
 
 type tileMeta struct {
@@ -519,3 +585,44 @@ func (t *tileMeta) colorTile() (ct colorTile) {
 }
 
 type colorTile [8][8]color.RGBA
+
+type zoneLookerWriter struct {
+	unbuf bytes.Buffer
+	n     int
+}
+
+func (w *zoneLookerWriter) Add(s string) {
+	w.n++
+	if w.n > 0xffff {
+		panic("too many unique leaves")
+	}
+	w.unbuf.WriteString(s)
+	switch s[0] {
+	case 'S':
+		w.unbuf.WriteByte(0)
+	case '2':
+		if len(s) != 12+1 {
+			panic("unexpected length")
+		}
+	case 'P':
+		if len(s) != 128+1 {
+			panic("unexpected length")
+		}
+	default:
+		panic("unexpected type")
+	}
+}
+
+func (w *zoneLookerWriter) Source() []byte {
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	zw.Write(w.unbuf.Bytes())
+	zw.Close()
+
+	bstr := base64.StdEncoding.EncodeToString(buf.Bytes())
+	buf.Reset()
+	fmt.Fprintf(&buf, "leaf = make([]zoneLooker, %d)\n", w.n)
+	fmt.Fprintf(&buf, "uniqueLeavesPacked = %q\n", bstr)
+	log.Printf("zone lookers packed line = %d bytes", buf.Len())
+	return buf.Bytes()
+}
