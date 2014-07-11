@@ -1,4 +1,4 @@
-This is a Go package which maps  (lat, long) to a timezone.
+This is a Go package which maps a (lat, long) to a timezone.
 
 My motivation was figuring out the UTC time of a JPG with EXIF
 metadata containing GPS coordinates and local time, but no timezone
