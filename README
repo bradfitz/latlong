@@ -23,6 +23,6 @@ Another image of the underlying data structure:
 
     http://i.imgur.com/Rt8bLSD.png
 
-... the boxes are only there for debugging, to show areas with only one
-timezone. Tiles without boxes around the still work; it's _not_ that
-inaccurate :)
+... the tile borders are only there for debugging, to show areas with
+only one timezone. Tiles without borders around them still work; at
+that level, the small possible bitmap is used for lookup.
