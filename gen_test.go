@@ -38,7 +38,9 @@ import (
 	"testing"
 	"time"
 
-	"code.google.com/p/freetype-go/freetype/raster"
+	"golang.org/x/image/math/fixed"
+
+	"github.com/golang/freetype/raster"
 	"github.com/jonas-p/go-shp"
 )
 
@@ -107,11 +109,11 @@ func worldImage(t *testing.T) (im *image.RGBA, zoneOfColor map[color.RGBA]string
 		painter := raster.NewRGBAPainter(im)
 		painter.SetColor(col)
 		r := raster.NewRasterizer(width, height)
-		r.Start(raster.Point{X: raster.Fix32(xys[0]) << 8, Y: raster.Fix32(xys[1]) << 8})
+		r.Start(fixed.Point26_6{X: fixed.Int26_6(xys[0]) << 6, Y: fixed.Int26_6(xys[1]) << 6})
 		for i := 2; i < len(xys); i += 2 {
-			r.Add1(raster.Point{X: raster.Fix32(xys[i]) << 8, Y: raster.Fix32(xys[i+1]) << 8})
+			r.Add1(fixed.Point26_6{X: fixed.Int26_6(xys[i]) << 6, Y: fixed.Int26_6(xys[i+1]) << 6})
 		}
-		r.Add1(raster.Point{X: raster.Fix32(xys[0]) << 8, Y: raster.Fix32(xys[1]) << 8})
+		r.Add1(fixed.Point26_6{X: fixed.Int26_6(xys[0]) << 6, Y: fixed.Int26_6(xys[1]) << 6})
 		r.Rasterize(raster.NewMonochromePainter(painter))
 	}
 
@@ -132,7 +134,8 @@ func worldImage(t *testing.T) (im *image.RGBA, zoneOfColor map[color.RGBA]string
 			continue
 		}
 		if _, err := time.LoadLocation(zoneName); err != nil {
-			t.Fatalf("Failed to load: %v (%v)", zoneName, err)
+			t.Logf("Failed to load: %v (%v)", zoneName, err)
+			continue
 		}
 		hash := crc32.Checksum([]byte(zoneName), tab)
 		col := color.RGBA{uint8(hash >> 24), uint8(hash >> 16), uint8(hash >> 8), 255}
