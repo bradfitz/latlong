@@ -38,9 +38,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jonas-p/go-shp"
-	"golang.org/x/image/math/fixed"
 	"github.com/golang/freetype/raster"
+	shp "github.com/jonas-p/go-shp"
+	"golang.org/x/image/math/fixed"
 )
 
 var (
@@ -113,7 +113,7 @@ func worldImage(t *testing.T) (im *image.RGBA, zoneOfColor map[color.RGBA]string
 			r.Add1(fixed.P(xys[i], xys[i+1]))
 		}
 		r.Add1(fixed.P(xys[0], xys[1]))
-		r.Rasterize(&MyMonochromePainter{Painter: painter})
+		r.Rasterize(raster.NewMonochromePainter(painter))
 	}
 
 	sr, err := shp.Open("world/tz_world.shp")
