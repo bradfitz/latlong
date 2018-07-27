@@ -3,7 +3,7 @@ This is a Go package which maps a (lat, long) to a timezone.
 My motivation was figuring out the UTC time of a JPG with EXIF
 metadata containing GPS coordinates and local time, but no timezone
 offset. This is a surprising number of photos. I built this to
-improve sorting in Camlistore, especially when photos are intermixed
+improve sorting in Perkeep, especially when photos are intermixed
 with tweets, checkins, etc, but it should be generally applicable.
 
 See docs at http://godoc.org/github.com/bradfitz/latlong
