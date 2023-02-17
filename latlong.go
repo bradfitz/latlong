@@ -84,35 +84,83 @@ func lookupPixel(x, y int) string {
 
 var unpackOnce sync.Once
 
+// func unpackTables() {
+// 	for _, zl := range zoomLevels {
+// 		reader := base64.NewDecoder(base64.StdEncoding,
+// 			strings.NewReader(zl.gzipData))
+// 		zr, err := gzip.NewReader(reader)
+// 		check(err)
+// 		defer zr.Close()
+
+// 		slurp, err := ioutil.ReadAll(zr)
+// 		check(err)
+// 		if len(slurp)%6 != 0 {
+// 			panic("bogus encoded tileLooker length")
+// 		}
+// 		zl.tiles = make([]tileLooker, len(slurp)/6)
+// 		for i := range zl.tiles {
+// 			idx := i * 6
+// 			zl.tiles[i] = tileLooker{
+// 				tileKey(binary.BigEndian.Uint32(slurp[idx : idx+4])),
+// 				binary.BigEndian.Uint16(slurp[idx+4 : idx+6]),
+// 			}
+// 		}
+// 	}
+
+// 	zr, err := gzip.NewReader(
+// 		base64.NewDecoder(base64.StdEncoding,
+// 			strings.NewReader(uniqueLeavesPacked)))
+// 	check(err)
+// 	br := bufio.NewReader(zr)
+// 	var buf [128]byte
+// 	for i := range leaf {
+// 		t, err := br.ReadByte()
+// 		check(err)
+// 		switch t {
+// 		default:
+// 			panic("unknown leaf type: " + fmt.Sprintf("%q", t))
+// 		case 'S': // static zone
+// 			v, err := br.ReadBytes(0) // null-terminated
+// 			check(err)
+// 			leaf[i] = staticZone(string(v[:len(v)-1]))
+// 		case '2': // two-timezone 1bpp bitmap (pass.bitmapPixmapBytes)
+// 			_, err := io.ReadFull(br, buf[:12])
+// 			check(err)
+// 			t := oneBitTile{
+// 				idx: [2]uint16{
+// 					binary.BigEndian.Uint16(buf[0:2]),
+// 					binary.BigEndian.Uint16(buf[2:4]),
+// 				},
+// 			}
+// 			bits := binary.BigEndian.Uint64(buf[4:12])
+// 			for y := range t.rows {
+// 				for x := 0; x < 8; x++ {
+// 					if bits&(1<<uint(y*8+x)) != 0 {
+// 						t.rows[y] |= (1 << uint(x))
+// 					}
+// 				}
+// 			}
+// 			leaf[i] = t
+// 		case 'P': // multi-timezone 4bpp bitmap
+// 			_, err := io.ReadFull(br, buf[:128])
+// 			check(err)
+// 			leaf[i] = pixmap(buf[:128])
+// 		}
+// 	}
+
+// }
+
 func unpackTables() {
 	for _, zl := range zoomLevels {
-		reader := base64.NewDecoder(base64.StdEncoding,
-			strings.NewReader(zl.gzipData))
-		zr, err := gzip.NewReader(reader)
-		check(err)
-		defer zr.Close()
-
-		slurp, err := ioutil.ReadAll(zr)
-		check(err)
-		if len(slurp)%6 != 0 {
-			panic("bogus encoded tileLooker length")
-		}
-		zl.tiles = make([]tileLooker, len(slurp)/6)
-		for i := range zl.tiles {
-			idx := i * 6
-			zl.tiles[i] = tileLooker{
-				tileKey(binary.BigEndian.Uint32(slurp[idx : idx+4])),
-				binary.BigEndian.Uint16(slurp[idx+4 : idx+6]),
-			}
-		}
+		zl.unpackTiles()
 	}
 
-	zr, err := gzip.NewReader(
-		base64.NewDecoder(base64.StdEncoding,
-			strings.NewReader(uniqueLeavesPacked)))
+	uniqueLeavesReader := base64.NewDecoder(base64.StdEncoding, strings.NewReader(uniqueLeavesPacked))
+	zr, err := gzip.NewReader(uniqueLeavesReader)
 	check(err)
+	defer zr.Close()
+
 	br := bufio.NewReader(zr)
-	var buf [128]byte
 	for i := range leaf {
 		t, err := br.ReadByte()
 		check(err)
@@ -120,34 +168,69 @@ func unpackTables() {
 		default:
 			panic("unknown leaf type: " + fmt.Sprintf("%q", t))
 		case 'S': // static zone
-			v, err := br.ReadBytes(0) // null-terminated
-			check(err)
-			leaf[i] = staticZone(string(v[:len(v)-1]))
+			leaf[i] = readStaticZone(br)
 		case '2': // two-timezone 1bpp bitmap (pass.bitmapPixmapBytes)
-			_, err := io.ReadFull(br, buf[:12])
-			check(err)
-			t := oneBitTile{
-				idx: [2]uint16{
-					binary.BigEndian.Uint16(buf[0:2]),
-					binary.BigEndian.Uint16(buf[2:4]),
-				},
-			}
-			bits := binary.BigEndian.Uint64(buf[4:12])
-			for y := range t.rows {
-				for x := 0; x < 8; x++ {
-					if bits&(1<<uint(y*8+x)) != 0 {
-						t.rows[y] |= (1 << uint(x))
-					}
-				}
-			}
-			leaf[i] = t
+			leaf[i] = readOneBitTile(br)
 		case 'P': // multi-timezone 4bpp bitmap
-			_, err := io.ReadFull(br, buf[:128])
-			check(err)
-			leaf[i] = pixmap(buf[:128])
+			leaf[i] = readPixmap(br)
 		}
 	}
+}
 
+func (zl *zoomLevel) unpackTiles() {
+	reader := base64.NewDecoder(base64.StdEncoding, strings.NewReader(zl.gzipData))
+	zr, err := gzip.NewReader(reader)
+	check(err)
+	defer zr.Close()
+
+	slurp, err := ioutil.ReadAll(zr)
+	check(err)
+	if len(slurp)%6 != 0 {
+		panic("bogus encoded tileLooker length")
+	}
+
+	zl.tiles = make([]tileLooker, len(slurp)/6)
+	for i := range zl.tiles {
+		idx := i * 6
+		zl.tiles[i] = tileLooker{
+			tileKey(binary.BigEndian.Uint32(slurp[idx : idx+4])),
+			binary.BigEndian.Uint16(slurp[idx+4 : idx+6]),
+		}
+	}
+}
+
+func readStaticZone(br *bufio.Reader) staticZone {
+	v, err := br.ReadBytes(0) // null-terminated
+	check(err)
+	return staticZone(string(v[:len(v)-1]))
+}
+
+func readOneBitTile(br *bufio.Reader) oneBitTile {
+	var buf [12]byte
+	_, err := io.ReadFull(br, buf[:])
+	check(err)
+	t := oneBitTile{
+		idx: [2]uint16{
+			binary.BigEndian.Uint16(buf[0:2]),
+			binary.BigEndian.Uint16(buf[2:4]),
+		},
+	}
+	bits := binary.BigEndian.Uint64(buf[4:12])
+	for y := range t.rows {
+		for x := 0; x < 8; x++ {
+			if bits&(1<<uint(y*8+x)) != 0 {
+				t.rows[y] |= (1 << uint(x))
+			}
+		}
+	}
+	return t
+}
+
+func readPixmap(br *bufio.Reader) pixmap {
+	var buf [128]byte
+	_, err := io.ReadFull(br, buf[:])
+	check(err)
+	return pixmap(buf[:])
 }
 
 func check(err error) {
