@@ -90,6 +90,8 @@ func unpackTables() {
 			base64.NewDecoder(base64.StdEncoding,
 				strings.NewReader(zl.gzipData)))
 		check(err)
+		defer zr.Close()
+
 		slurp, err := ioutil.ReadAll(zr)
 		check(err)
 		if len(slurp)%6 != 0 {
