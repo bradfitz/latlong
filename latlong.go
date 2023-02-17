@@ -86,9 +86,9 @@ var unpackOnce sync.Once
 
 func unpackTables() {
 	for _, zl := range zoomLevels {
-		zr, err := gzip.NewReader(
-			base64.NewDecoder(base64.StdEncoding,
-				strings.NewReader(zl.gzipData)))
+		reader := base64.NewDecoder(base64.StdEncoding,
+			strings.NewReader(zl.gzipData))
+		zr, err := gzip.NewReader(reader)
 		check(err)
 		defer zr.Close()
 
